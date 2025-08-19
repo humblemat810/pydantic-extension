@@ -81,7 +81,56 @@ def use_mode(mode: str | None):
         yield
     finally:
         _CURRENT_MODE.reset(token)
+from typing import ForwardRef, List, Set, Tuple, Dict
 
+def _deep_slice_annotation(
+    ann: Any,
+    include_modes: set[str],
+    exclude_modes: set[str],
+) -> Any:
+    """Return an annotation where any ModeSlicingMixin subclass inside is replaced
+    by its corresponding slice, recursively through Optional/Union/Annotated and containers.
+    """
+    origin = get_origin(ann)
+
+    # Deal with Annotated[T, ...] -> slice T, keep metadata
+    if origin is Annotated:
+        base, *meta = get_args(ann)
+        sliced = _deep_slice_annotation(base, include_modes, exclude_modes)
+        return Annotated[sliced, *meta]
+
+    # Optional/Union recursion
+    if origin is not None and origin in (Union, getattr(__import__("typing"), "UnionType", None)):
+        return Union[tuple(_deep_slice_annotation(a, include_modes, exclude_modes) for a in get_args(ann))]  # type: ignore
+
+    # Containers
+    if origin in (list, List, set, Set, tuple, Tuple):
+        args = tuple(_deep_slice_annotation(a, include_modes, exclude_modes) for a in get_args(ann))
+        return origin[args]  # type: ignore
+    if origin in (dict, Dict):
+        k, v = get_args(ann)
+        return dict[_deep_slice_annotation(k, include_modes, exclude_modes),  # type: ignore
+                    _deep_slice_annotation(v, include_modes, exclude_modes)]
+
+    # ForwardRef: keep as-is (or resolve if you want)
+    if isinstance(ann, ForwardRef):
+        return ann
+
+    # Bare class: if it’s a ModeSlicingMixin subclass, slice it
+    try:
+        if isinstance(ann, type) and issubclass(ann, ModeSlicingMixin):
+            # build the same include/exclude spec this parent is using
+            if include_modes or exclude_modes:
+                spec: list[Any] = sorted(include_modes)
+                if exclude_modes:
+                    spec.append(NotMode(*sorted(exclude_modes)))
+                return ann.__class_getitem__(tuple(spec))
+            else:
+                return ann  # nothing to do
+    except TypeError:
+        pass
+
+    return ann
 def _infer_mode_from_stack(
     *,
     module_hints: tuple[str, ...] = ("langchain", "langgraph"),
@@ -395,7 +444,9 @@ class ModeSlicingMixin:
 
             if (pos or unmarked_ok) and not excluded_by_global and not excluded_by_field_marker:
                 info_copy = copy.deepcopy(original)
+                sliced_ann = _deep_slice_annotation(info_copy.annotation, include_modes, exclude_modes)
                 try:
+                    info_copy.annotation = sliced_ann
                     fields_for_dynamic[fname] = (info_copy.annotation, info_copy)
                 except TypeError:
                     fi = info_copy
