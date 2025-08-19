@@ -479,37 +479,50 @@ class ModeSlicingMixin:
         field_mode_exclude: Iterable[str] | str | None = None,
         dump_format: Literal["python", "json"] = "python",
         node_mode: bool = False,
+        context: dict | None = None,   # <-- NEW: accept inbound context
         **kwargs,
     ) -> dict[str, Any]:
-        """
-        Mode-aware dump. Back-compat alias: if caller supplied `field_exclude=`,
-        we treat it as `field_mode_exclude=`.
-        """
-        # Back-compat: alias `field_exclude` -> `field_mode_exclude`
+        # Back-compat alias
         if field_mode_exclude is None and "field_exclude" in kwargs:
             field_mode_exclude = kwargs.pop("field_exclude")
 
         if dump_format not in {"python", "json"}:
             raise ValueError("dump_format must be 'python' or 'json'")
 
-        # 1) If caller didn't specify field_mode, try ContextVar then stack sniff
+        # ---- (A) Resolve mode: explicit > ContextVar > inbound context > stack ----
         if field_mode is None:
+            # ContextVar
             try:
                 ctx_mode = _CURRENT_MODE.get()
             except Exception:
                 ctx_mode = None
+
             if ctx_mode:
                 field_mode = ctx_mode
-            elif getattr(self.__class__, "stack_mode_detection", True):
-                guessed = _infer_mode_from_stack(
-                    module_hints=getattr(self.__class__, "stack_mode_module_hints", ("langchain", "langgraph")),
-                    module_contains_any=getattr(self.__class__, "stack_mode_module_contains_any", ("output_parsers", "tools", "structured")),
-                    function_hints=getattr(self.__class__, "stack_mode_function_hints", ("with_structured_output", "as_structured_output", "parse_result", "parse", "bind_tools", "tool")),
-                    max_depth=getattr(self.__class__, "stack_mode_max_depth", 40),
-                )
-                if guessed:
-                    field_mode = guessed
+            else:
+                # inbound context from a parent dump
+                if isinstance(context, dict):
+                    token = context.get("hasql_field_mode")
+                    if isinstance(token, str) and token:
+                        field_mode = token
+                # last resort: stack sniff
+                if field_mode is None and getattr(self.__class__, "stack_mode_detection", True):
+                    guessed = _infer_mode_from_stack(
+                        module_hints=getattr(self.__class__, "stack_mode_module_hints", ("langchain","langgraph")),
+                        module_contains_any=getattr(self.__class__, "stack_mode_module_contains_any", ("output_parsers","tools","structured")),
+                        function_hints=getattr(self.__class__, "stack_mode_function_hints", ("with_structured_output","as_structured_output","parse_result","parse","bind_tools","tool")),
+                        max_depth=getattr(self.__class__, "stack_mode_max_depth", 40),
+                    )
+                    if guessed:
+                        field_mode = guessed
 
+        # If exclude modes not explicitly provided, read from inbound context
+        if field_mode_exclude is None and isinstance(context, dict):
+            exc_token = context.get("hasql_field_mode_exclude")
+            if isinstance(exc_token, str) and exc_token:
+                field_mode_exclude = exc_token.split(",")
+
+        # ---- (B) Build inc/exc sets (explicit or defaults) ----
         inc: set[str] = set()
         exc: set[str] = set()
 
@@ -526,7 +539,6 @@ class ModeSlicingMixin:
             else:
                 exc = {m.lower() for m in field_mode_exclude}
 
-        # Apply defaults ONLY if BOTH are empty
         applied_defaults = False
         if not inc and not exc:
             inc = set(getattr(self.__class__, "default_include_modes", set()))
@@ -544,13 +556,12 @@ class ModeSlicingMixin:
                     warnings.warn(msg, stacklevel=2)
                     self.__class__._conflict_warned_classes.add(self.__class__)
 
-        # Normalize include/exclude provided by caller
+        # ---- (C) Compute include/exclude-by-name from modes (your existing logic) ----
         include = kwargs.pop("include", None)
         exclude = kwargs.pop("exclude", None)
         current_include = None if include is None else (set(include) if not isinstance(include, dict) else include)
         current_exclude = None if exclude is None else (set(exclude) if not isinstance(exclude, dict) else exclude)
 
-        # Build include set from modes
         if inc or exc:
             hints = get_type_hints(self.__class__, include_extras=True)
             wanted: set[str] = set()
@@ -558,10 +569,9 @@ class ModeSlicingMixin:
                 f_modes = self.__class__._field_modes_from_hint(hint)
                 pos = bool(f_modes & inc) if inc else False
                 unmarked_ok = (not f_modes) and bool(inc & self.__class__.include_unmarked_for_modes)
-                # Keep "exclusion wins" semantics (as discussed)
-                excluded_by_global = bool(f_modes & exc)
-                excluded_by_field_marker = self.__class__._has_exclude_for_modes(hint, inc if inc else exc)
-                if (pos or unmarked_ok) and not excluded_by_global and not excluded_by_field_marker:
+                excluded_by_global = bool(f_modes & exc)  # (keep your “exclusion wins” semantics)
+                excluded_by_field = self.__class__._has_exclude_for_modes(hint, inc if inc else exc)
+                if (pos or unmarked_ok) and not excluded_by_global and not excluded_by_field:
                     wanted.add(fname)
 
             if current_include is None:
@@ -571,7 +581,7 @@ class ModeSlicingMixin:
             else:
                 current_include = {k: v for k, v in current_include.items() if k in wanted}
 
-        # node_mode: drop nested relation-like values using predicate
+        # ---- (D) node_mode: drop nested models (unchanged) ----
         node_drops = set()
         if node_mode:
             fields_to_check = (
@@ -593,10 +603,22 @@ class ModeSlicingMixin:
             for f in node_drops:
                 current_exclude[f] = True
 
+        # ---- (E) NEW: propagate effective modes to children via `context` ----
+        out_ctx = dict(context) if isinstance(context, dict) else {}
+        # mode include token
+        if inc:
+            out_ctx["hasql_field_mode"] = "+".join(sorted(inc))
+        elif isinstance(field_mode, str) and field_mode:  # e.g., "*" or from stack
+            out_ctx["hasql_field_mode"] = field_mode
+        # mode exclude token
+        if exc:
+            out_ctx["hasql_field_mode_exclude"] = ",".join(sorted(exc))
+
         return super().model_dump(
             mode=dump_format,
             include=current_include,
             exclude=current_exclude,
+            context=out_ctx,          # <-- CHILDREN SEE THE SAME MODES
             **kwargs,
         )
 
@@ -612,8 +634,9 @@ if __name__ == "__main__":
     from typing import Optional, Union, Annotated
 
     print("== Demo: base modes & defaults ==")
-
-    class Alien(PydBaseModel):
+    class MixinModel(ModeSlicingMixin, PydBaseModel):
+        pass
+    class Alien(MixinModel):
         # Defaults when no explicit modes are passed
         default_include_modes = {"dto", "frontend"}
         default_exclude_modes = {"llm"}
@@ -643,7 +666,7 @@ if __name__ == "__main__":
     AlienLLM = Alien["llm"]
     print("Alien['llm'] schema properties:", list(AlienLLM.model_json_schema().get("properties", {}).keys()))
     # ['weapon']
-    class Alien2(PydBaseModel):
+    class Alien2(MixinModel):
         # Defaults when no explicit modes are passed
         default_include_modes = {"llm"}
         include_unmarked_for_modes = {"dto", "frontend", "backend", "llm"}  # llm sees no unmarked by default
@@ -661,7 +684,7 @@ if __name__ == "__main__":
     
     print("\n== Demo: per-class dynamic mode registration and dynamic Annotated ==")
 
-    class WithAdmin(PydBaseModel):
+    class WithAdmin(MixinModel):
         pass
 
     # Register a new mode on this class branch and capture the marker class
@@ -690,7 +713,7 @@ if __name__ == "__main__":
 
     print("\n== Demo: field-level ExcludeMode ==")
 
-    class Secretive(PydBaseModel):
+    class Secretive(MixinModel):
         default_include_modes = {"dto", "frontend"}
         secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(...)
         title: Annotated[str, DtoField()] = Field()
@@ -702,7 +725,7 @@ if __name__ == "__main__":
 
     print("\n== Demo: defaults conflict warning ==")
 
-    class Overlap(PydBaseModel):
+    class Overlap(MixinModel):
         default_include_modes = {"dto", "llm"}
         default_exclude_modes = {"llm"}  # conflict -> warn/error once
         a: Annotated[int, DtoField()] = Field(1)
@@ -714,11 +737,11 @@ if __name__ == "__main__":
 
     print("\n== Demo: node_mode (drops SQLModel-valued relationships) ==")
 
-    class NodeChild(PydBaseModel):
+    class NodeChild(MixinModel):
         default_include_modes = {"dto"}
         value: Annotated[int, DtoField()] = Field(1)
 
-    class NodeParent(PydBaseModel):
+    class NodeParent(MixinModel):
         default_include_modes = {"dto"}
         child: Annotated[NodeChild, DtoField()] = Field(default_factory=NodeChild)
         label: Annotated[str, DtoField()] = Field("parent")
@@ -744,15 +767,18 @@ if __name__ == "__main__":
 
     print("\n--- Spy (exclude-mode) extended demo ---")
 
-    class Spy(PydBaseModel):
+    class Spy(MixinModel):
         default_include_modes = {"backend"}
         include_unmarked_for_modes = {"backend"}
 
         codename: Annotated[str, FrontendField()] = Field("X")
         notes: Annotated[str, BackendField(), ExcludeMode("dto", "llm")] = Field("internal")
         public: Annotated[str, DtoField()] = Field("ok")
-
+    class Infiltrated(MixinModel):
+        spies : list[Spy]
+        
     s2 = Spy()
+    
     print("--- Spy: dto (notes excluded by ExcludeMode) ---")
     print(s2.model_dump(field_mode="dto"))  # {'public': 'ok'}
 
@@ -760,8 +786,15 @@ if __name__ == "__main__":
     print(s2.model_dump(field_mode="backend"))  # {'notes': 'internal'}
 
     print("\n--- Mixed: Optional/Union nesting demo ---")
-
-    class Mixed(PydBaseModel):
+    hq = Infiltrated(spies = [s2])
+    print("--- nested model test")
+    print(hq.model_dump(field_mode="dto"))
+    
+    with use_mode("dto") as um:
+        print(hq.model_dump())
+        pass
+    
+    class Mixed(MixinModel):
         default_include_modes = {"dto"}
         include_unmarked_for_modes = {"dto"}
 
@@ -781,7 +814,7 @@ if __name__ == "__main__":
 
     print("\n--- Nesting Annotated aliases demo ---")
 
-    class Nesting_dto_backend(PydBaseModel):
+    class Nesting_dto_backend(MixinModel):
         # Here we rely on recursive metadata extraction to see Frontend + Backend + Dto
         name: FrontendType[BackendType[DtoType[str]]] = Field("n")
 
@@ -794,7 +827,7 @@ if __name__ == "__main__":
 
     print("\n--- Conflict_default class (warn at class creation) ---")
 
-    class Conflict_default(PydBaseModel):
+    class Conflict_default(MixinModel):
         default_include_modes = {"dto"}
         default_exclude_modes = {"dto"}
         name: DtoType[str] = Field("n")
@@ -803,7 +836,7 @@ if __name__ == "__main__":
         vec: LLMType[int] = Field(1)
 
     # ------------------ Exclude-only class slice ------------------
-    class Both(PydBaseModel):
+    class Both(MixinModel):
         name: DtoType[str] = Field("n")
         ui: FrontendType[str] = Field("u")
         sys: BackendType[str] = Field("b")
@@ -818,7 +851,7 @@ if __name__ == "__main__":
     print(b.model_dump(field_mode_exclude={"llm"}))
 
     # ------------------ Defaults conflict warnings (runtime) ------------------
-    class Conflicting(PydBaseModel):
+    class Conflicting(MixinModel):
         default_include_modes = {"dto", "llm"}
         default_exclude_modes = {"llm"}  # overlap on 'llm'
         default_conflict_policy = "warn"  # set to 'error' to raise
