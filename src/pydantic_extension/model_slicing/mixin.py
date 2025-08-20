@@ -40,7 +40,6 @@ Notes
 - If you call model_json_schema() on the base class from a structured-output LC stack, we’ll prefer the 'llm'
   slice shape but normalize the schema "title" back to the base class name so tool/function mapping remains stable.
 """
-
 # ----------------------------
 # Context keys (generic + overridable)
 # ----------------------------
@@ -482,7 +481,9 @@ class ModeSlicingMixin:
         cfg["from_attributes"] = True
         Dynamic.model_config = ConfigDict(**cfg)
         Dynamic.__module__ = cls.__module__
-
+        Dynamic.__module__ = cls.__module__
+        Dynamic.__modeslice_base__ = cls                      # <— add
+        Dynamic.__modeslice_modes__ = (include_modes, exclude_modes)  # <— add (optional but handy)
         cls._slice_cache[cache_key] = Dynamic
         return Dynamic
 
@@ -859,16 +860,17 @@ def _resolve_target_model_type(field_type: Any) -> Any:
         return _modeslice_base_of(field_type)
     return field_type
 
-# ---------- coerce arbitrary value into target annotation (recursively) ----------
 def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
     origin = get_origin(target_type)
     args = get_args(target_type)
 
+    # Strip Annotated
     if origin is Annotated:
         target_type = args[0]
         origin = get_origin(target_type)
         args = get_args(target_type)
 
+    # Containers
     if origin in (list, tuple, set):
         inner = args[0] if args else Any
         seq = [] if value is None else list(value)
@@ -882,9 +884,14 @@ def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
 
     if origin is dict:
         kt, vt = args if len(args) == 2 else (Any, Any)
-        src = value or {}
-        return { _coerce_value_to_target(k, kt): _coerce_value_to_target(v, vt) for k, v in src.items() }
+        if value is None:
+            return None
+        return {
+            _coerce_value_to_target(k, kt): _coerce_value_to_target(v, vt)
+            for k, v in value.items()
+        }
 
+    # Union – best effort
     if origin in (Union, getattr(__import__("typing"), "UnionType", None)):
         for arm in args:
             try:
@@ -893,14 +900,18 @@ def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
                 continue
         return value
 
+    # If the target type is a modeslice class, resolve to its base
     if _is_modeslice_model_type(target_type):
         target_type = _modeslice_base_of(target_type)
 
+    # If value is a Pydantic model, convert to plain dict (do NOT validate to the target here)
     if _is_pydantic_model_type(target_type):
         if isinstance(value, PydBaseModel):
-            value = value.model_dump()  # shallow is fine; we recurse
-        return target_type.model_validate(value)
+            return value.model_dump()
+        # If it's already a dict-like for that model, keep as-is; validation happens at the top level
+        return value
 
+    # Scalars / everything else
     return value
 
 # ---------- JSONPath-lite setters: a.b.c, arr[0], props["k"] ----------
@@ -953,84 +964,117 @@ def _get_or_create_root(data: dict) -> dict:
     return data
 
 def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_ok: bool = True):
-    """
-    Set value at path in a plain dict (pre-validation). Creates intermediate dicts/lists as needed.
-    Path like: 'a.b[0].c' or 'props["x.y"]'.
-    If value is callable and value_fn_ok=True, it will be called as value(current_value) -> new_value.
-    """
     tokens = _tokenize_path(path)
-    cur = _get_or_create_root(data)
+    cur = data
+    parent_stack = []  # [(parent, key_or_index)]
 
-    for idx, (kind, tok) in enumerate(tokens):
-        last = idx == len(tokens) - 1
+    def _ensure_dict_here():
+        nonlocal cur
+        if isinstance(cur, PydBaseModel):
+            cur = cur.model_dump()
+            p, k = parent_stack[-1] if parent_stack else (None, None)
+            if p is not None:
+                p[k] = cur
+        elif not isinstance(cur, (dict, list)):
+            # replace unknown with dict
+            replacement = {}
+            p, k = parent_stack[-1] if parent_stack else (None, None)
+            if p is not None:
+                p[k] = replacement
+            cur = replacement
+
+    i = 0
+    while i < len(tokens):
+        kind, tok = tokens[i]
+        last = (i == len(tokens) - 1)
 
         if kind == "attr":
             key = tok
+            _ensure_dict_here()
+            if isinstance(cur, list):
+                # Cannot use attribute on a list; this indicates the previous
+                # step should have navigated into an item. Treat as error-safe dict.
+                # Convert the list slot we just came from into dict if needed.
+                pass
             if last:
-                if not overwrite and key in cur:
+                if not overwrite and key in cur and cur[key] is not None:
                     return
                 cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
             else:
-                if key not in cur or not isinstance(cur[key], (dict, list)):
+                if key not in cur or not isinstance(cur[key], (dict, list, PydBaseModel)):
                     cur[key] = {}
+                parent_stack.append((cur, key))
                 cur = cur[key]
 
         elif kind == "index":
-            # try int index; else treat as dict key string (e.g., ["k:v"])
+            # Try integer index; if fail, treat as dict key string
             try:
-                k = int(tok)
+                idx = int(tok)
+                # If current node is a model, turn into dict first
+                _ensure_dict_here()
+                if isinstance(cur, dict):
+                    # We must have arrived here via an attribute just before; turn that slot into a list
+                    # parent is the last pushed (cur was already updated)
+                    # Make sure current dict is actually the list holder; create list if needed
+                    # Find parent and key to replace dict with list (if just created)
+                    # If we can't find parent, just create a list in place
+                    p, k = parent_stack[-1] if parent_stack else (None, None)
+                    if p is not None and isinstance(p, dict) and p.get(k) is cur:
+                        if not isinstance(p[k], list):
+                            p[k] = []
+                        cur = p[k]
+                    else:
+                        # If we didn't just come from an attr, ensure cur is a list
+                        if not isinstance(cur, list):
+                            # Replace this node with a list only if we can
+                            # Otherwise, create a temporary list and discard (best-effort)
+                            tmp = []
+                            cur = tmp
+
+                # Now ensure it's a list
                 if not isinstance(cur, list):
-                    # convert non-list to list
-                    next_obj = []
-                    # keep existing mapping? if dict with numeric keys, you could migrate; keep simple for now
-                    cur_key = tokens[idx-1][1] if idx > 0 and tokens[idx-1][0] == "attr" else None
-                    if cur_key is not None:
-                        # parent was dict holding this list
-                        parent = data
-                    # assign a list in place
-                    # if previous was attribute, cur refers to dict value (already)
-                    # No-op here; we just replace cur with list
-                    pass
-                    # best effort: if current is dict, replace it with list
-                    if isinstance(cur, dict):
-                        # this will modify the object referenced by parent chain already
-                        cur.clear()
-                        cur.update({})  # ensure dict remains; but we need a list — cannot mutate type in place
-                        # safer: if we hit this, just create a list and return
-                        lst = []
-                        cur = lst
-                # ensure length
-                if isinstance(cur, list):
-                    _ensure_container(cur, k)
-                    if last:
-                        if not overwrite and cur[k] not in (None, {}, []):
-                            return
-                        cur[k] = value(cur[k]) if (value_fn_ok and callable(value)) else value
-                    else:
-                        if not isinstance(cur[k], (dict, list)):
-                            cur[k] = {}
-                        cur = cur[k]
+                    # Create a new list if it's not
+                    new_list = []
+                    # attach to parent if possible
+                    if parent_stack:
+                        p, k = parent_stack[-1]
+                        p[k] = new_list
+                    cur = new_list
+
+                # Ensure length
+                while len(cur) <= idx:
+                    cur.append({})
+
+                if last:
+                    if not overwrite and cur[idx] not in (None, {}, []):
+                        return
+                    # If the target slot is a model, convert to dict before writing
+                    if isinstance(cur[idx], PydBaseModel):
+                        cur[idx] = cur[idx].model_dump()
+                    cur[idx] = value(cur[idx]) if (value_fn_ok and callable(value)) else value
                 else:
-                    # if we couldn't coerce to list, fallback to dict-key semantics
-                    key = tok
-                    if last:
-                        if not overwrite and key in cur:
-                            return
-                        cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
-                    else:
-                        if key not in cur or not isinstance(cur[key], (dict, list)):
-                            cur[key] = {}
-                        cur = cur[key]
+                    # Descend into the element; ensure it’s dict-like
+                    if isinstance(cur[idx], PydBaseModel):
+                        cur[idx] = cur[idx].model_dump()
+                    if not isinstance(cur[idx], (dict, list)):
+                        cur[idx] = {}
+                    parent_stack.append((cur, idx))
+                    cur = cur[idx]
             except ValueError:
+                # Non-integer inside brackets -> treat as dict key (quoted key)
                 key = tok.strip().strip('"').strip("'")
+                _ensure_dict_here()
                 if last:
                     if not overwrite and key in cur:
                         return
                     cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
                 else:
-                    if key not in cur or not isinstance(cur[key], (dict, list)):
+                    if key not in cur or not isinstance(cur[key], (dict, list, PydBaseModel)):
                         cur[key] = {}
-                    cur = cur[key]  
+                    parent_stack.append((cur, key))
+                    cur = cur[key]
+        i += 1
+
     
     
 def promote_to_base(

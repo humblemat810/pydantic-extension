@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydantic-extension"
-version = "0.0.4"
+version = "0.0.5"
 authors = [
   { name="HumbleMat", email="humblemat@gmail.com" },
 ]
