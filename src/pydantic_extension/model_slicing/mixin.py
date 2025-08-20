@@ -11,7 +11,7 @@ from typing import (
     Union, get_args, get_origin, get_type_hints, Callable
 )
 
-from pydantic import BaseModel as PydBaseModel
+from pydantic import BaseModel as PydBaseModel, ValidationInfo, model_validator
 from pydantic import Field, ConfigDict, create_model
 from pydantic import field_serializer, SerializationInfo
 
@@ -72,6 +72,12 @@ LLMType: TypeAlias = Annotated[T, LLMField()]
 # ----------------------------
 
 _CURRENT_MODE: ContextVar[str | None] = ContextVar("_modeslice_current_mode", default=None)
+
+_VALIDATION_REDIRECT_GUARD: ContextVar[bool] = ContextVar(
+    "modeslice_validation_redirect_guard", default=False
+)
+
+_MS_CONTEXT: ContextVar[dict] = ContextVar("_modeslice_context", default={})
 
 @contextmanager
 def use_mode(mode: str | None):
@@ -202,7 +208,12 @@ def _default_overlap_msg(cls: type, overlap: set[str]) -> str:
         f"{cls.__name__}: default include/exclude overlap on modes {sorted(overlap)} — "
         "exclusion wins if defaults are applied. Pass field_mode/field_mode_exclude to override."
     )
-
+def print_pydantic_like_schema(model_cls):
+    print(f"class {model_cls.__name__}(BaseModel):")
+    for name, field in model_cls.model_fields.items():
+        ann = field.annotation.__name__ if hasattr(field.annotation, "__name__") else field.annotation
+        default = "..." if field.is_required() else repr(field.default)
+        print(f"    {name}: {ann} = {default}")
 # ----------------------------
 # Mixin (works with any Pydantic model)
 # ----------------------------
@@ -764,17 +775,327 @@ class ModeSlicingMixin:
 
         # Scalars / all other cases → default behavior
         return handler(value)
+    prefer_llm_validation_on_stack: ClassVar[bool] = True  # turn off if you don’t want this behavior
 
+    @classmethod
+    def _should_redirect_to_llm_slice_for_validation(cls, context: dict | None) -> bool:
+        # If context explicitly sets a mode, don't redirect
+        if isinstance(context, dict):
+            tok = context.get(cls._ctx_mode_key())
+            if isinstance(tok, str) and tok:
+                return False
+
+        # If a ContextVar mode is set, respect it (no redirect)
+        try:
+            cv = _CURRENT_MODE.get()
+        except Exception:
+            cv = None
+        if cv == "llm":
+            return True
+        elif cv:
+            return False
+        # cv is None here
+        if not getattr(cls, "prefer_llm_validation_on_stack", True):
+            return False
+
+        # Otherwise sniff the stack: inside LC structured output?
+        guessed = _infer_mode_from_stack(
+            module_hints=getattr(cls, "stack_mode_module_hints", ("langchain","langgraph")),
+            module_contains_any=getattr(cls, "stack_mode_module_contains_any", ("output_parsers","tools","structured")),
+            function_hints=getattr(cls, "stack_mode_function_hints", ("with_structured_output","as_structured_output","parse_result","parse","bind_tools","tool")),
+            max_depth=getattr(cls, "stack_mode_max_depth", 40),
+        )
+        return guessed == "llm"
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _redirect_ctor_to_llm_slice(cls, input_value, handler, info: ValidationInfo):
+        # prevent infinite recursion
+        if _VALIDATION_REDIRECT_GUARD.get():
+            return handler(input_value)
+        cv_sniff_env_result = cls._should_redirect_to_llm_slice_for_validation(info.context)
+        if cv_sniff_env_result:
+            Slice = cls.__class_getitem__("llm")
+            try:
+                _VALIDATION_REDIRECT_GUARD.set(True)
+                # Validate against the LLM slice and RETURN THE SLICE INSTANCE
+                # This means callers receive `Slice` objects, not `cls`.
+                return Slice.model_validate(input_value, context=info.context)
+            finally:
+                _VALIDATION_REDIRECT_GUARD.set(False)
+
+        # normal path → construct `cls`
+        return handler(input_value)
+    
+    
+#==================================
+# 
+# Sliced to Base implementation
+# 
+#====================    
+# ---------- helpers to detect slice/base ----------
+def _is_modeslice_model_type(t: Any) -> bool:
+    return isinstance(t, type) and issubclass(t, PydBaseModel) and hasattr(t, "__modeslice_base__")
+
+def _modeslice_base_of(t: Any) -> Any:
+    return getattr(t, "__modeslice_base__", None)
+
+def _is_pydantic_model_type(t: Any) -> bool:
+    return isinstance(t, type) and issubclass(t, PydBaseModel)
+
+# ---------- resolve the intended target model type from an annotation ----------
+def _resolve_target_model_type(field_type: Any) -> Any:
+    origin = get_origin(field_type)
+    if origin is Union or origin is getattr(__import__("typing"), "UnionType", None):
+        for arg in get_args(field_type):
+            base = _resolve_target_model_type(arg)
+            if _is_pydantic_model_type(base):
+                return base
+        return field_type
+    if origin is Annotated:
+        base, *_ = get_args(field_type)
+        return _resolve_target_model_type(base)
+    if _is_modeslice_model_type(field_type):
+        return _modeslice_base_of(field_type)
+    return field_type
+
+# ---------- coerce arbitrary value into target annotation (recursively) ----------
+def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
+    origin = get_origin(target_type)
+    args = get_args(target_type)
+
+    if origin is Annotated:
+        target_type = args[0]
+        origin = get_origin(target_type)
+        args = get_args(target_type)
+
+    if origin in (list, tuple, set):
+        inner = args[0] if args else Any
+        seq = [] if value is None else list(value)
+        casted = [_coerce_value_to_target(v, inner) for v in seq]
+        if origin is list:
+            return casted
+        if origin is tuple:
+            return tuple(casted)
+        if origin is set:
+            return set(casted)
+
+    if origin is dict:
+        kt, vt = args if len(args) == 2 else (Any, Any)
+        src = value or {}
+        return { _coerce_value_to_target(k, kt): _coerce_value_to_target(v, vt) for k, v in src.items() }
+
+    if origin in (Union, getattr(__import__("typing"), "UnionType", None)):
+        for arm in args:
+            try:
+                return _coerce_value_to_target(value, arm)
+            except Exception:
+                continue
+        return value
+
+    if _is_modeslice_model_type(target_type):
+        target_type = _modeslice_base_of(target_type)
+
+    if _is_pydantic_model_type(target_type):
+        if isinstance(value, PydBaseModel):
+            value = value.model_dump()  # shallow is fine; we recurse
+        return target_type.model_validate(value)
+
+    return value
+
+# ---------- JSONPath-lite setters: a.b.c, arr[0], props["k"] ----------
+def _tokenize_path(path: str):
+    tokens, buf, i = [], "", 0
+    in_brackets = False
+    in_quotes = False
+    quote_char = ""
+    while i < len(path):
+        ch = path[i]
+        if in_brackets:
+            if in_quotes:
+                if ch == quote_char:
+                    in_quotes = False
+                else:
+                    buf += ch
+            else:
+                if ch in ("'", '"'):
+                    in_quotes = True; quote_char = ch
+                elif ch == ']':
+                    tokens.append(("index", buf))
+                    buf = ""; in_brackets = False
+                else:
+                    buf += ch
+        else:
+            if ch == '.':
+                if buf:
+                    tokens.append(("attr", buf)); buf = ""
+            elif ch == '[':
+                if buf:
+                    tokens.append(("attr", buf)); buf = ""
+                in_brackets = True
+            else:
+                buf += ch
+        i += 1
+    if buf:
+        tokens.append(("attr", buf))
+    return tokens
+
+def _ensure_container(parent: Any, key: Any):
+    if isinstance(key, int):
+        # ensure list long enough
+        while len(parent) <= key:
+            parent.append({})
+    else:
+        if key not in parent:
+            parent[key] = {}
+
+def _get_or_create_root(data: dict) -> dict:
+    return data
+
+def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_ok: bool = True):
+    """
+    Set value at path in a plain dict (pre-validation). Creates intermediate dicts/lists as needed.
+    Path like: 'a.b[0].c' or 'props["x.y"]'.
+    If value is callable and value_fn_ok=True, it will be called as value(current_value) -> new_value.
+    """
+    tokens = _tokenize_path(path)
+    cur = _get_or_create_root(data)
+
+    for idx, (kind, tok) in enumerate(tokens):
+        last = idx == len(tokens) - 1
+
+        if kind == "attr":
+            key = tok
+            if last:
+                if not overwrite and key in cur:
+                    return
+                cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
+            else:
+                if key not in cur or not isinstance(cur[key], (dict, list)):
+                    cur[key] = {}
+                cur = cur[key]
+
+        elif kind == "index":
+            # try int index; else treat as dict key string (e.g., ["k:v"])
+            try:
+                k = int(tok)
+                if not isinstance(cur, list):
+                    # convert non-list to list
+                    next_obj = []
+                    # keep existing mapping? if dict with numeric keys, you could migrate; keep simple for now
+                    cur_key = tokens[idx-1][1] if idx > 0 and tokens[idx-1][0] == "attr" else None
+                    if cur_key is not None:
+                        # parent was dict holding this list
+                        parent = data
+                    # assign a list in place
+                    # if previous was attribute, cur refers to dict value (already)
+                    # No-op here; we just replace cur with list
+                    pass
+                    # best effort: if current is dict, replace it with list
+                    if isinstance(cur, dict):
+                        # this will modify the object referenced by parent chain already
+                        cur.clear()
+                        cur.update({})  # ensure dict remains; but we need a list — cannot mutate type in place
+                        # safer: if we hit this, just create a list and return
+                        lst = []
+                        cur = lst
+                # ensure length
+                if isinstance(cur, list):
+                    _ensure_container(cur, k)
+                    if last:
+                        if not overwrite and cur[k] not in (None, {}, []):
+                            return
+                        cur[k] = value(cur[k]) if (value_fn_ok and callable(value)) else value
+                    else:
+                        if not isinstance(cur[k], (dict, list)):
+                            cur[k] = {}
+                        cur = cur[k]
+                else:
+                    # if we couldn't coerce to list, fallback to dict-key semantics
+                    key = tok
+                    if last:
+                        if not overwrite and key in cur:
+                            return
+                        cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
+                    else:
+                        if key not in cur or not isinstance(cur[key], (dict, list)):
+                            cur[key] = {}
+                        cur = cur[key]
+            except ValueError:
+                key = tok.strip().strip('"').strip("'")
+                if last:
+                    if not overwrite and key in cur:
+                        return
+                    cur[key] = value(cur.get(key)) if (value_fn_ok and callable(value)) else value
+                else:
+                    if key not in cur or not isinstance(cur[key], (dict, list)):
+                        cur[key] = {}
+                    cur = cur[key]  
+    
+    
+def promote_to_base(
+    instance: PydBaseModel,
+    *,
+    defaults: dict[str, Any] | None = None,
+    path_defaults: dict[str, Any] | None = None,
+    only_if_missing: bool = True,
+) -> PydBaseModel:
+    """
+    Convert a sliced instance (or base) to the *base class* instance.
+
+    - Recursively converts nested slice models to base model types.
+    - Fills missing fields from `defaults` (top-level) and `path_defaults` (by path).
+    - Pydantic then fills remaining defaults or raises if required fields are still missing.
+
+    `defaults`: { "field": value | callable(current_value)->new_value }
+    `path_defaults`: { "a.b[0].c": value | callable(current_value)->new_value }
+    `only_if_missing`: if False, overrides existing values too.
+    """
+    src_cls = instance.__class__
+    base_cls = getattr(src_cls, "__modeslice_base__", src_cls)
+
+    # Build a dict targeting base types
+    data: dict[str, Any] = {}
+    for name, field in base_cls.model_fields.items():
+        target_type = _resolve_target_model_type(field.annotation)
+        if hasattr(instance, name):
+            raw = getattr(instance, name)
+            data[name] = _coerce_value_to_target(raw, target_type)
+        # else: leave absent, so Pydantic can apply defaults or error
+
+    # Apply top-level defaults
+    if defaults:
+        for k, v in defaults.items():
+            if only_if_missing and k in data and data[k] is not None:
+                continue
+            data[k] = v(data.get(k)) if callable(v) else v
+
+    # Apply path defaults (nested)
+    if path_defaults:
+        for path, v in path_defaults.items():
+            set_by_path(data, path, v, overwrite=not only_if_missing)
+
+    # Validate into the base class (fills field defaults, runs validators)
+    return base_cls.model_validate(data)
 # ----------------------------
 # DEMOS (non-pytest smoke tests)
 # ----------------------------
 if __name__ == "__main__":
     from typing import Optional, Union
-
-    print("== Demo: base modes & defaults ==")
-
+    
     class MixinModel(ModeSlicingMixin, PydBaseModel):
         pass
+    class xdemo (MixinModel):
+        # Defaults when no explicit modes are passed
+        default_include_modes = {"dto", "frontend"}
+        default_exclude_modes = {"llm"}
+        include_unmarked_for_modes = {"dto", "frontend", "backend"}  # llm sees no unmarked by default
+
+        secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(..., description="secret-key")
+        format_instruction : LLMType[str] = Field("Hi AI", description="secret-key")
+    print(xdemo(secret = '1234').model_dump(field_mode = "llm"))
+    print("== Demo: base modes & defaults ==")
+
 
     class Spy(MixinModel):
         default_include_modes = {"backend"}
@@ -805,6 +1126,7 @@ if __name__ == "__main__":
         weapon: Annotated[int, DtoField(), FrontendField(), LLMField()] = Field(description="weapon code")
         message: Annotated[str, DtoField()] = Field(description="external message")
         misc: str = Field(description="unmarked general field")
+        
 
     x = Alien(secret="S3CR3T", weapon=7, message="hi", misc="note")
 
