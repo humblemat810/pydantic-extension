@@ -50,7 +50,11 @@ CONTEXT_EXCLUDE_KEY = "modeslice:exclude"
 # Markers & aliases
 # ----------------------------
 
-class BaseMarker: ...
+class BaseMarker:
+    # Allow: AdminField[int]  ->  Annotated[int, AdminField()]
+    @classmethod
+    def __class_getitem__(cls, typ):
+        return Annotated[typ, cls()]
 class ExcludeMode(BaseMarker):
     def __init__(self, *modes: str):
         self.modes = {m.lower() for m in modes}
@@ -1209,12 +1213,15 @@ if __name__ == "__main__":
 
     AdminField = WithAdmin.register_mode("admin")
 
+
+
     class Staff(WithAdmin):
         name: Annotated[str, DtoField(), FrontendField()] = Field()
         clearance: WithAdmin.build_annotated(int, "admin", "backend") = Field(default=0)
+        admin_code: AdminField[str] = Field(...)
         note: str = Field(default="unmarked")
 
-    s = Staff(name="Neo", clearance=5, note="ops")
+    s = Staff(name="Neo", clearance=5, note="ops", admin_code = 'T1@RA810')
 
     print("Staff modes:", Staff.modes())
     print("Staff dto dump (includes unmarked by default):")
