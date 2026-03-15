@@ -40,6 +40,7 @@ Notes
 - If you call model_json_schema() on the base class from a structured-output LC stack, we’ll prefer the 'llm'
   slice shape but normalize the schema "title" back to the base class name so tool/function mapping remains stable.
 """
+
 # ----------------------------
 # Context keys (generic + overridable)
 # ----------------------------
@@ -51,7 +52,7 @@ CONTEXT_EXCLUDE_KEY = "modeslice:exclude"
 # ----------------------------
 
 class BaseMarker:
-    # Allow: AdminField[int]  ->  Annotated[int, AdminField()]
+    # Allow: AdminField[int] -> Annotated[int, AdminField()]
     @classmethod
     def __class_getitem__(cls, typ):
         return Annotated[typ, cls()]
@@ -211,12 +212,16 @@ def _default_overlap_msg(cls: type, overlap: set[str]) -> str:
         f"{cls.__name__}: default include/exclude overlap on modes {sorted(overlap)} — "
         "exclusion wins if defaults are applied. Pass field_mode/field_mode_exclude to override."
     )
+
+
 def print_pydantic_like_schema(model_cls):
     print(f"class {model_cls.__name__}(BaseModel):")
     for name, field in model_cls.model_fields.items():
         ann = field.annotation.__name__ if hasattr(field.annotation, "__name__") else field.annotation
         default = "..." if field.is_required() else repr(field.default)
         print(f"    {name}: {ann} = {default}")
+
+
 # ----------------------------
 # Mixin (works with any Pydantic model)
 # ----------------------------
@@ -485,9 +490,9 @@ class ModeSlicingMixin:
         cfg["from_attributes"] = True
         Dynamic.model_config = ConfigDict(**cfg)
         Dynamic.__module__ = cls.__module__
-        Dynamic.__module__ = cls.__module__
-        Dynamic.__modeslice_base__ = cls                      # <— add
-        Dynamic.__modeslice_modes__ = (include_modes, exclude_modes)  # <— add (optional but handy)
+        Dynamic.__modeslice_base__ = cls
+        Dynamic.__modeslice_modes__ = (include_modes, exclude_modes)
+
         cls._slice_cache[cache_key] = Dynamic
         return Dynamic
 
@@ -584,6 +589,7 @@ class ModeSlicingMixin:
         # ---- (B) Build inc/exc sets (explicit or defaults) ----
         inc: set[str] = set()
         exc: set[str] = set()
+        requested_exc: set[str] = set()
 
         if field_mode:
             if isinstance(field_mode, str):
@@ -594,15 +600,24 @@ class ModeSlicingMixin:
 
         if field_mode_exclude:
             if isinstance(field_mode_exclude, str):
-                exc = {field_mode_exclude.lower()}
+                requested_exc = {field_mode_exclude.lower()}
             else:
-                exc = {m.lower() for m in field_mode_exclude}
+                requested_exc = {m.lower() for m in field_mode_exclude}
 
         applied_defaults = False
+        if inc:
+            exc = set(requested_exc)
+        else:
+            default_inc = set(getattr(self.__class__, "default_include_modes", set()))
+            default_exc = set(getattr(self.__class__, "default_exclude_modes", set()))
+            if default_inc or default_exc:
+                inc = default_inc
+                exc = default_exc | requested_exc
+                applied_defaults = True
+
         if not inc and not exc:
             inc = set(getattr(self.__class__, "default_include_modes", set()))
             exc = set(getattr(self.__class__, "default_exclude_modes", set()))
-            applied_defaults = True
 
         if applied_defaults:
             overlap = inc & exc
@@ -726,18 +741,18 @@ class ModeSlicingMixin:
         # 3) Match Pydantic's target ("json" vs "python")
         dump_format = "json" if getattr(info, "mode", None) == "json" else "python"
 
-        # 4) Helpers to serialize nested values
+        # 4) Helpers to serialize nested values without feeding already-dumped
+        # dicts back through serializers that still expect model instances.
         def dump_child(obj):
-            # Only force custom dump for *our* mixin subclasses
             if isinstance(obj, ModeSlicingMixin):
                 return obj.model_dump(dump_format=dump_format, context=ctx_out)
-            # Let Pydantic handle other BaseModels (keeps their custom serializers)
             if isinstance(obj, PydBaseModel):
-                return handler(obj)
+                return obj.model_dump(mode=dump_format, context=ctx_out)
             return handler(obj)
 
         def transform_container(obj):
-            # Lists / tuples: replace mixin items, then let handler finish (e.g. datetimes)
+            # Containers with nested models are serialized element-wise here so
+            # Pydantic does not re-check typed fields against already-dumped dicts.
             if isinstance(obj, list):
                 changed = False
                 tmp = []
@@ -745,9 +760,12 @@ class ModeSlicingMixin:
                     if isinstance(it, ModeSlicingMixin):
                         tmp.append(it.model_dump(dump_format=dump_format, context=ctx_out))
                         changed = True
+                    elif isinstance(it, PydBaseModel):
+                        tmp.append(it.model_dump(mode=dump_format, context=ctx_out))
+                        changed = True
                     else:
                         tmp.append(it)
-                return handler(tmp) if changed else handler(obj)
+                return tmp if changed else handler(obj)
             if isinstance(obj, tuple):
                 changed = False
                 tmp = []
@@ -755,9 +773,12 @@ class ModeSlicingMixin:
                     if isinstance(it, ModeSlicingMixin):
                         tmp.append(it.model_dump(dump_format=dump_format, context=ctx_out))
                         changed = True
+                    elif isinstance(it, PydBaseModel):
+                        tmp.append(it.model_dump(mode=dump_format, context=ctx_out))
+                        changed = True
                     else:
                         tmp.append(it)
-                return handler(tuple(tmp)) if changed else handler(obj)
+                return tuple(tmp) if changed else handler(obj)
             if isinstance(obj, dict):
                 changed = False
                 tmp = {}
@@ -765,9 +786,12 @@ class ModeSlicingMixin:
                     if isinstance(v, ModeSlicingMixin):
                         tmp[k] = v.model_dump(dump_format=dump_format, context=ctx_out)
                         changed = True
+                    elif isinstance(v, PydBaseModel):
+                        tmp[k] = v.model_dump(mode=dump_format, context=ctx_out)
+                        changed = True
                     else:
                         tmp[k] = v
-                return handler(tmp) if changed else handler(obj)
+                return tmp if changed else handler(obj)
             return None  # not a container
 
         # 5) Apply logic: single model, container, or other
@@ -780,34 +804,36 @@ class ModeSlicingMixin:
 
         # Scalars / all other cases → default behavior
         return handler(value)
-    prefer_llm_validation_on_stack: ClassVar[bool] = True  # turn off if you don’t want this behavior
+
+    prefer_llm_validation_on_stack: ClassVar[bool] = True
 
     @classmethod
     def _should_redirect_to_llm_slice_for_validation(cls, context: dict | None) -> bool:
-        # If context explicitly sets a mode, don't redirect
         if isinstance(context, dict):
             tok = context.get(cls._ctx_mode_key())
             if isinstance(tok, str) and tok:
                 return False
 
-        # If a ContextVar mode is set, respect it (no redirect)
         try:
             cv = _CURRENT_MODE.get()
         except Exception:
             cv = None
+
         if cv == "llm":
             return True
-        elif cv:
+        if cv:
             return False
-        # cv is None here
         if not getattr(cls, "prefer_llm_validation_on_stack", True):
             return False
 
-        # Otherwise sniff the stack: inside LC structured output?
         guessed = _infer_mode_from_stack(
-            module_hints=getattr(cls, "stack_mode_module_hints", ("langchain","langgraph")),
-            module_contains_any=getattr(cls, "stack_mode_module_contains_any", ("output_parsers","tools","structured")),
-            function_hints=getattr(cls, "stack_mode_function_hints", ("with_structured_output","as_structured_output","parse_result","parse","bind_tools","tool")),
+            module_hints=getattr(cls, "stack_mode_module_hints", ("langchain", "langgraph")),
+            module_contains_any=getattr(cls, "stack_mode_module_contains_any", ("output_parsers", "tools", "structured")),
+            function_hints=getattr(
+                cls,
+                "stack_mode_function_hints",
+                ("with_structured_output", "as_structured_output", "parse_result", "parse", "bind_tools", "tool"),
+            ),
             max_depth=getattr(cls, "stack_mode_max_depth", 40),
         )
         return guessed == "llm"
@@ -815,40 +841,32 @@ class ModeSlicingMixin:
     @model_validator(mode="wrap")
     @classmethod
     def _redirect_ctor_to_llm_slice(cls, input_value, handler, info: ValidationInfo):
-        # prevent infinite recursion
         if _VALIDATION_REDIRECT_GUARD.get():
             return handler(input_value)
-        cv_sniff_env_result = cls._should_redirect_to_llm_slice_for_validation(info.context)
-        if cv_sniff_env_result:
+
+        if cls._should_redirect_to_llm_slice_for_validation(info.context):
             Slice = cls.__class_getitem__("llm")
             try:
                 _VALIDATION_REDIRECT_GUARD.set(True)
-                # Validate against the LLM slice and RETURN THE SLICE INSTANCE
-                # This means callers receive `Slice` objects, not `cls`.
                 return Slice.model_validate(input_value, context=info.context)
             finally:
                 _VALIDATION_REDIRECT_GUARD.set(False)
 
-        # normal path → construct `cls`
         return handler(input_value)
-    
-    
-#==================================
-# 
-# Sliced to Base implementation
-# 
-#====================    
-# ---------- helpers to detect slice/base ----------
+
+
 def _is_modeslice_model_type(t: Any) -> bool:
     return isinstance(t, type) and issubclass(t, PydBaseModel) and hasattr(t, "__modeslice_base__")
+
 
 def _modeslice_base_of(t: Any) -> Any:
     return getattr(t, "__modeslice_base__", None)
 
+
 def _is_pydantic_model_type(t: Any) -> bool:
     return isinstance(t, type) and issubclass(t, PydBaseModel)
 
-# ---------- resolve the intended target model type from an annotation ----------
+
 def _resolve_target_model_type(field_type: Any) -> Any:
     origin = get_origin(field_type)
     if origin is Union or origin is getattr(__import__("typing"), "UnionType", None):
@@ -864,17 +882,16 @@ def _resolve_target_model_type(field_type: Any) -> Any:
         return _modeslice_base_of(field_type)
     return field_type
 
+
 def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
     origin = get_origin(target_type)
     args = get_args(target_type)
 
-    # Strip Annotated
     if origin is Annotated:
         target_type = args[0]
         origin = get_origin(target_type)
         args = get_args(target_type)
 
-    # Containers
     if origin in (list, tuple, set):
         inner = args[0] if args else Any
         seq = [] if value is None else list(value)
@@ -895,7 +912,6 @@ def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
             for k, v in value.items()
         }
 
-    # Union – best effort
     if origin in (Union, getattr(__import__("typing"), "UnionType", None)):
         for arm in args:
             try:
@@ -904,21 +920,17 @@ def _coerce_value_to_target(value: Any, target_type: Any) -> Any:
                 continue
         return value
 
-    # If the target type is a modeslice class, resolve to its base
     if _is_modeslice_model_type(target_type):
         target_type = _modeslice_base_of(target_type)
 
-    # If value is a Pydantic model, convert to plain dict (do NOT validate to the target here)
     if _is_pydantic_model_type(target_type):
         if isinstance(value, PydBaseModel):
             return value.model_dump()
-        # If it's already a dict-like for that model, keep as-is; validation happens at the top level
         return value
 
-    # Scalars / everything else
     return value
 
-# ---------- JSONPath-lite setters: a.b.c, arr[0], props["k"] ----------
+
 def _tokenize_path(path: str):
     tokens, buf, i = [], "", 0
     in_brackets = False
@@ -934,19 +946,23 @@ def _tokenize_path(path: str):
                     buf += ch
             else:
                 if ch in ("'", '"'):
-                    in_quotes = True; quote_char = ch
-                elif ch == ']':
+                    in_quotes = True
+                    quote_char = ch
+                elif ch == "]":
                     tokens.append(("index", buf))
-                    buf = ""; in_brackets = False
+                    buf = ""
+                    in_brackets = False
                 else:
                     buf += ch
         else:
-            if ch == '.':
+            if ch == ".":
                 if buf:
-                    tokens.append(("attr", buf)); buf = ""
-            elif ch == '[':
+                    tokens.append(("attr", buf))
+                    buf = ""
+            elif ch == "[":
                 if buf:
-                    tokens.append(("attr", buf)); buf = ""
+                    tokens.append(("attr", buf))
+                    buf = ""
                 in_brackets = True
             else:
                 buf += ch
@@ -955,22 +971,24 @@ def _tokenize_path(path: str):
         tokens.append(("attr", buf))
     return tokens
 
+
 def _ensure_container(parent: Any, key: Any):
     if isinstance(key, int):
-        # ensure list long enough
         while len(parent) <= key:
             parent.append({})
     else:
         if key not in parent:
             parent[key] = {}
 
+
 def _get_or_create_root(data: dict) -> dict:
     return data
+
 
 def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_ok: bool = True):
     tokens = _tokenize_path(path)
     cur = data
-    parent_stack = []  # [(parent, key_or_index)]
+    parent_stack = []
 
     def _ensure_dict_here():
         nonlocal cur
@@ -980,7 +998,6 @@ def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_
             if p is not None:
                 p[k] = cur
         elif not isinstance(cur, (dict, list)):
-            # replace unknown with dict
             replacement = {}
             p, k = parent_stack[-1] if parent_stack else (None, None)
             if p is not None:
@@ -990,15 +1007,12 @@ def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_
     i = 0
     while i < len(tokens):
         kind, tok = tokens[i]
-        last = (i == len(tokens) - 1)
+        last = i == len(tokens) - 1
 
         if kind == "attr":
             key = tok
             _ensure_dict_here()
             if isinstance(cur, list):
-                # Cannot use attribute on a list; this indicates the previous
-                # step should have navigated into an item. Treat as error-safe dict.
-                # Convert the list slot we just came from into dict if needed.
                 pass
             if last:
                 if not overwrite and key in cur and cur[key] is not None:
@@ -1011,53 +1025,35 @@ def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_
                 cur = cur[key]
 
         elif kind == "index":
-            # Try integer index; if fail, treat as dict key string
             try:
                 idx = int(tok)
-                # If current node is a model, turn into dict first
                 _ensure_dict_here()
                 if isinstance(cur, dict):
-                    # We must have arrived here via an attribute just before; turn that slot into a list
-                    # parent is the last pushed (cur was already updated)
-                    # Make sure current dict is actually the list holder; create list if needed
-                    # Find parent and key to replace dict with list (if just created)
-                    # If we can't find parent, just create a list in place
                     p, k = parent_stack[-1] if parent_stack else (None, None)
                     if p is not None and isinstance(p, dict) and p.get(k) is cur:
                         if not isinstance(p[k], list):
                             p[k] = []
                         cur = p[k]
-                    else:
-                        # If we didn't just come from an attr, ensure cur is a list
-                        if not isinstance(cur, list):
-                            # Replace this node with a list only if we can
-                            # Otherwise, create a temporary list and discard (best-effort)
-                            tmp = []
-                            cur = tmp
+                    elif not isinstance(cur, list):
+                        cur = []
 
-                # Now ensure it's a list
                 if not isinstance(cur, list):
-                    # Create a new list if it's not
                     new_list = []
-                    # attach to parent if possible
                     if parent_stack:
                         p, k = parent_stack[-1]
                         p[k] = new_list
                     cur = new_list
 
-                # Ensure length
                 while len(cur) <= idx:
                     cur.append({})
 
                 if last:
                     if not overwrite and cur[idx] not in (None, {}, []):
                         return
-                    # If the target slot is a model, convert to dict before writing
                     if isinstance(cur[idx], PydBaseModel):
                         cur[idx] = cur[idx].model_dump()
                     cur[idx] = value(cur[idx]) if (value_fn_ok and callable(value)) else value
                 else:
-                    # Descend into the element; ensure it’s dict-like
                     if isinstance(cur[idx], PydBaseModel):
                         cur[idx] = cur[idx].model_dump()
                     if not isinstance(cur[idx], (dict, list)):
@@ -1065,7 +1061,6 @@ def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_
                     parent_stack.append((cur, idx))
                     cur = cur[idx]
             except ValueError:
-                # Non-integer inside brackets -> treat as dict key (quoted key)
                 key = tok.strip().strip('"').strip("'")
                 _ensure_dict_here()
                 if last:
@@ -1079,8 +1074,7 @@ def set_by_path(data: dict, path: str, value: Any, *, overwrite: bool, value_fn_
                     cur = cur[key]
         i += 1
 
-    
-    
+
 def promote_to_base(
     instance: PydBaseModel,
     *,
@@ -1088,132 +1082,88 @@ def promote_to_base(
     path_defaults: dict[str, Any] | None = None,
     only_if_missing: bool = True,
 ) -> PydBaseModel:
-    """
-    Convert a sliced instance (or base) to the *base class* instance.
-
-    - Recursively converts nested slice models to base model types.
-    - Fills missing fields from `defaults` (top-level) and `path_defaults` (by path).
-    - Pydantic then fills remaining defaults or raises if required fields are still missing.
-
-    `defaults`: { "field": value | callable(current_value)->new_value }
-    `path_defaults`: { "a.b[0].c": value | callable(current_value)->new_value }
-    `only_if_missing`: if False, overrides existing values too.
-    """
     src_cls = instance.__class__
     base_cls = getattr(src_cls, "__modeslice_base__", src_cls)
 
-    # Build a dict targeting base types
     data: dict[str, Any] = {}
     for name, field in base_cls.model_fields.items():
         target_type = _resolve_target_model_type(field.annotation)
         if hasattr(instance, name):
             raw = getattr(instance, name)
             data[name] = _coerce_value_to_target(raw, target_type)
-        # else: leave absent, so Pydantic can apply defaults or error
 
-    # Apply top-level defaults
     if defaults:
         for k, v in defaults.items():
             if only_if_missing and k in data and data[k] is not None:
                 continue
             data[k] = v(data.get(k)) if callable(v) else v
 
-    # Apply path defaults (nested)
     if path_defaults:
         for path, v in path_defaults.items():
             set_by_path(data, path, v, overwrite=not only_if_missing)
 
-    # Validate into the base class (fills field defaults, runs validators)
     return base_cls.model_validate(data)
+
 # ----------------------------
 # DEMOS (non-pytest smoke tests)
 # ----------------------------
 if __name__ == "__main__":
-    from typing import Optional, Union
-    
+    def section(title: str):
+        print(f"\n== {title} ==")
+
+    def show(label: str, value):
+        print(f"{label}: {value}")
+
     class MixinModel(ModeSlicingMixin, PydBaseModel):
-        pass
-    class xdemo (MixinModel):
-        # Defaults when no explicit modes are passed
-        default_include_modes = {"dto", "frontend"}
-        default_exclude_modes = {"llm"}
-        include_unmarked_for_modes = {"dto", "frontend", "backend"}  # llm sees no unmarked by default
+        stack_mode_detection: ClassVar[bool] = False
 
-        secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(..., description="secret-key")
-        format_instruction : LLMType[str] = Field("Hi AI", description="secret-key")
-    print(xdemo(secret = '1234').model_dump(field_mode = "llm"))
-    print("== Demo: base modes & defaults ==")
-
+    section("Agency Defaults")
 
     class Spy(MixinModel):
-        default_include_modes = {"backend"}
-        include_unmarked_for_modes = {"backend"}
+        default_include_modes: ClassVar[set[str]] = {"backend"}
+        include_unmarked_for_modes: ClassVar[set[str]] = {"backend"}
 
         codename: Annotated[str, FrontendField()] = Field("X")
         notes: Annotated[str, BackendField(), ExcludeMode("dto", "llm")] = Field("internal")
         public: Annotated[str, DtoField()] = Field("ok")
-        def model_dump(self, *arg, **kwarg):
-            return super().model_dump(*arg, **kwarg)
-            
 
     class Infiltrated(MixinModel):
         spies: list[Spy]
 
-    s2 = Spy()
-    hq = Infiltrated(spies=[s2])
-    print("--- nested model test (backend keeps unmarked list) ---")
-    print(hq.model_dump(field_mode="backend"))  # {'spies': [{'notes': 'internal'}]}
+    spy = Spy()
+    hq = Infiltrated(spies=[spy])
+    show("hq backend nested dump", hq.model_dump(field_mode="backend"))
+    show("spy dto dump", spy.model_dump(field_mode="dto"))
+    show("spy backend dump", spy.model_dump(field_mode="backend"))
 
     class Alien(MixinModel):
-        # Defaults when no explicit modes are passed
-        default_include_modes = {"dto", "frontend"}
-        default_exclude_modes = {"llm"}
-        include_unmarked_for_modes = {"dto", "frontend", "backend"}  # llm sees no unmarked by default
+        default_include_modes: ClassVar[set[str]] = {"dto", "frontend"}
+        default_exclude_modes: ClassVar[set[str]] = {"llm"}
+        include_unmarked_for_modes: ClassVar[set[str]] = {"dto", "frontend", "backend"}
 
         secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(..., description="secret-key")
         weapon: Annotated[int, DtoField(), FrontendField(), LLMField()] = Field(description="weapon code")
         message: Annotated[str, DtoField()] = Field(description="external message")
         misc: str = Field(description="unmarked general field")
-        
 
-    x = Alien(secret="S3CR3T", weapon=7, message="hi", misc="note")
+    alien = Alien(secret="S3CR3T", weapon=7, message="hi", misc="note")
+    show("alien default dump", alien.model_dump())
+    show("alien llm dump", alien.model_dump(field_mode="llm"))
+    show("alien backend dump", alien.model_dump(field_mode="backend"))
+    show("alien dto dump", alien.model_dump(field_mode="dto"))
+    show("alien exclude-only dump", alien.model_dump(field_mode_exclude="llm"))
+    show("alien star minus llm via field_exclude", alien.model_dump(field_mode="*", field_exclude="llm"))
+    show("alien default slice props", list(Alien.default_slice().model_json_schema()["properties"].keys()))
+    show("alien slice_for dto props", list(Alien.slice_for("dto").model_json_schema()["properties"].keys()))
+    with use_mode("backend"):
+        show("alien dump under use_mode('backend')", alien.model_dump())
 
-    print("Default dump (no modes) -> dto+frontend minus llm:")
-    print(x.model_dump())  # {'weapon': 7, 'message': 'hi', 'misc': 'note'}
-
-    print("LLM dump explicitly requested (defaults ignored):")
-    print(x.model_dump(field_mode="llm"))  # {'weapon': 7}
-
-    print("Backend dump includes unmarked:")
-    print(x.model_dump(field_mode="backend"))  # {'secret': 'S3CR3T', 'misc': 'note'}
-
-    print("DTO dump (includes unmarked per class rule):")
-    print(x.model_dump(field_mode="dto"))  # {'weapon': 7, 'message': 'hi', 'misc': 'note'}
-
-    AlienLLM = Alien["llm"]
-    print("Alien['llm'] schema properties:", list(AlienLLM.model_json_schema().get("properties", {}).keys()))
-
-    class Alien2(MixinModel):
-        default_include_modes = {"llm"}
-        include_unmarked_for_modes = {"dto", "frontend", "backend", "llm"}
-
-        secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(..., description="secret-key")
-        weapon: Annotated[int, DtoField(), FrontendField(), LLMField()] = Field(description="weapon code")
-        message: Annotated[str, DtoField(), LLMField()] = Field(description="external message")
-        misc: str = Field(description="unmarked general field")
-
-    x2 = Alien2(secret="S3CR3T", weapon=7, message="hi", misc="note")
-    print("default include llm (unmarked allowed by class):")
-    print(x2.model_dump(field_mode="llm"))
-
-    print("\n== Demo: per-class dynamic mode registration and dynamic Annotated ==")
+    section("Dynamic Markers")
 
     class WithAdmin(MixinModel):
         pass
 
     AdminField = WithAdmin.register_mode("admin")
-
-
 
     class Staff(WithAdmin):
         name: Annotated[str, DtoField(), FrontendField()] = Field()
@@ -1221,133 +1171,153 @@ if __name__ == "__main__":
         admin_code: AdminField[str] = Field(...)
         note: str = Field(default="unmarked")
 
-    s = Staff(name="Neo", clearance=5, note="ops", admin_code = 'T1@RA810')
+    staff = Staff(name="Neo", clearance=5, admin_code="T1@RA810", note="ops")
+    show("staff modes", sorted(Staff.modes()))
+    show("staff dto dump", staff.model_dump(field_mode="dto"))
+    show("staff admin dump", staff.model_dump(field_mode="admin"))
+    show("staff admin slice props", list(Staff["admin"].model_json_schema().get("properties", {}).keys()))
+    show("staff marker slice props", list(Staff[AdminField].model_json_schema().get("properties", {}).keys()))
+    show("staff all-but-admin props", list(Staff["*", "-admin"].model_json_schema().get("properties", {}).keys()))
 
-    print("Staff modes:", Staff.modes())
-    print("Staff dto dump (includes unmarked by default):")
-    print(s.model_dump(field_mode="dto"))
-    print("Staff admin slice class properties:")
-    print(list(Staff["admin"].model_json_schema().get("properties", {}).keys()))
-    print("Staff all-but-admin slice:")
-    print(list(Staff["*", "-admin"].model_json_schema().get("properties", {}).keys()))
+    section("Serializer Smoke")
 
-    print("\n== Demo: field-level ExcludeMode ==")
+    class Span(PydBaseModel):
+        start: int
+        end: int
 
-    class Secretive(MixinModel):
-        default_include_modes = {"dto", "frontend"}
-        secret: Annotated[str, BackendField(), ExcludeMode("llm")] = Field(...)
-        title: Annotated[str, DtoField()] = Field()
-        default_secret: str = Field("dEf@u1+", description='default secret')
+    class Grounding(MixinModel):
+        default_include_modes: ClassVar[set[str]] = {"dto"}
+        spans: Annotated[list[Span], DtoField()] = Field(default_factory=list)
 
-    sec = Secretive(secret="K", title="T")
-    print("Secretive llm dump (secret excluded by ExcludeMode):")
-    print(sec.model_dump(field_mode="llm"))  # {}
+    class Node(MixinModel):
+        default_include_modes: ClassVar[set[str]] = {"dto"}
+        mentions: Annotated[list[Grounding], DtoField()] = Field(default_factory=list)
 
-    print("\n== Demo: defaults conflict warning ==")
+    node = Node(mentions=[Grounding(spans=[Span(start=1, end=3)])])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        node_dump = node.model_dump()
+    show("node nested dump", node_dump)
+    show(
+        "serializer unexpected-value warnings",
+        [str(w.message) for w in caught if "PydanticSerializationUnexpectedValue" in str(w.message)],
+    )
 
-    class Overlap(MixinModel):
-        default_include_modes = {"dto", "llm"}
-        default_exclude_modes = {"llm"}  # conflict -> warn/error once
-        a: Annotated[int, DtoField()] = Field(1)
-        b: Annotated[int, LLMField()] = Field(2)
+    class Envelope(MixinModel):
+        default_include_modes: ClassVar[set[str]] = {"dto"}
+        points: Annotated[list[Span], DtoField()] = Field(default_factory=list)
+        trail: Annotated[tuple[Span, ...], DtoField()] = Field(default_factory=tuple)
+        lookup: Annotated[dict[str, Span], DtoField()] = Field(default_factory=dict)
 
-    ov = Overlap()
-    print("Overlap default dump (llm excluded by default overlap):")
-    print(ov.model_dump())  # {'a': 1}
+    envelope = Envelope(
+        points=[Span(start=5, end=8)],
+        trail=(Span(start=9, end=11),),
+        lookup={"lead": Span(start=12, end=13)},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        envelope_dump = envelope.model_dump()
+    show("plain BaseModel container dump", envelope_dump)
+    show(
+        "container unexpected-value warnings",
+        [str(w.message) for w in caught if "PydanticSerializationUnexpectedValue" in str(w.message)],
+    )
 
-    print("\n== Demo: node_mode (drops nested models) ==")
+    section("Promote To Base")
+
+    class ReferenceSession(MixinModel):
+        collection_page_url: Annotated[str, DtoField()]
+        doc_id: Annotated[str, DtoField()]
+        verification: Annotated[Optional[str], BackendField()] = None
+
+    class GraphEntityBase(MixinModel):
+        label: Annotated[str, DtoField()]
+        type: Annotated[Literal["entity", "relationship"], DtoField()]
+        summary: Annotated[str, DtoField()]
+        domain_id: Annotated[Optional[str], BackendField()] = None
+        references: Annotated[list[ReferenceSession], DtoField()]
+
+    graph_entity_dto = GraphEntityBase["dto"].model_validate(
+        {
+            "label": "Apple",
+            "type": "entity",
+            "summary": "Tech company",
+            "references": [{"collection_page_url": "http://coll", "doc_id": "doc-123"}],
+        }
+    )
+    promoted = promote_to_base(
+        graph_entity_dto,
+        defaults={"domain_id": "finance"},
+        path_defaults={"references[0].verification": "filled from context"},
+    )
+    show("slice type", type(graph_entity_dto).__name__)
+    show("promoted type", type(promoted).__name__)
+    show("promoted dump", promoted.model_dump(field_mode="*"))
+
+    section("Redirect And Schema Bias")
+
+    class StructuredOutput(MixinModel):
+        public: Annotated[str, LLMField()]
+        secret: Annotated[str, BackendField()]
+
+    with use_mode("llm"):
+        validated = StructuredOutput.model_validate({"public": "hello"})
+        show("validated type under use_mode('llm')", type(validated).__name__)
+        show("validated dump", validated.model_dump())
+        show("base schema title under llm context", StructuredOutput.model_json_schema()["title"])
+        show(
+            "base schema props under llm context",
+            list(StructuredOutput.model_json_schema()["properties"].keys()),
+        )
+
+    section("Conflict And Node Mode")
+
+    with warnings.catch_warnings(record=True) as overlap_warnings:
+        warnings.simplefilter("always")
+
+        class Overlap(MixinModel):
+            default_include_modes: ClassVar[set[str]] = {"dto", "llm"}
+            default_exclude_modes: ClassVar[set[str]] = {"llm"}
+            default_conflict_policy: ClassVar[str] = "warn"
+
+            a: Annotated[int, DtoField()] = Field(1)
+            b: Annotated[int, LLMField()] = Field(2)
+
+    overlap = Overlap()
+    show("overlap warning count", len(overlap_warnings))
+    show("overlap default dump", overlap.model_dump())
 
     class NodeChild(MixinModel):
-        default_include_modes = {"dto"}
+        default_include_modes: ClassVar[set[str]] = {"dto"}
         value: Annotated[int, DtoField()] = Field(1)
 
     class NodeParent(MixinModel):
-        default_include_modes = {"dto"}
+        default_include_modes: ClassVar[set[str]] = {"dto"}
         child: Annotated[NodeChild, DtoField()] = Field(default_factory=NodeChild)
         label: Annotated[str, DtoField()] = Field("parent")
 
     parent = NodeParent()
-    print("NodeParent dto dump (with node_mode=True drops relationship 'child'):")
-    print(parent.model_dump(field_mode="dto", node_mode=True))  # {'label': 'parent'}
+    show("node_mode dto dump", parent.model_dump(field_mode="dto", node_mode=True))
 
-    print("\n--- Alien: default + exclude-only (field_mode_exclude='llm') behaves as default-minus-llm ---")
-    print(x.model_dump(field_mode_exclude="llm"))
-
-    print("\n--- Alien: backend + dto + frontend with field_mode_exclude='llm' (all-minus-llm) ---")
-    print(x.model_dump(field_mode=["backend", "dto", "frontend"], field_mode_exclude="llm"))
-
-    print("\n--- Alien: class default slice (dto+frontend, not llm) ---")
-    AlienDefault = Alien.default_slice()
-    print(AlienDefault.model_json_schema()["properties"].keys())
-
-    print("\n--- Spy (exclude-mode) extended demo ---")
-    print("--- Spy: dto (notes excluded by ExcludeMode) ---")
-    print(s2.model_dump(field_mode="dto"))  # {'public': 'ok'}
-    print("--- Spy: backend (notes included; codename excluded) ---")
-    print(s2.model_dump(field_mode="backend"))  # {'notes': 'internal'}
-
-    print("\n--- Mixed: Optional/Union nesting demo ---")
-    print("--- nested model test (dto) ---")
-    print(hq.model_dump(field_mode="dto"))
-    with use_mode("dto"):
-        print(hq.model_dump())
+    section("Union And Alias Nesting")
 
     class Mixed(MixinModel):
-        default_include_modes = {"dto"}
-        include_unmarked_for_modes = {"dto"}
+        default_include_modes: ClassVar[set[str]] = {"dto"}
+        include_unmarked_for_modes: ClassVar[set[str]] = {"dto"}
 
         maybe_msg: Annotated[Optional[str], DtoField()] = Field(None)
         either: Annotated[Union[int, str], DtoField(), FrontendField()] = Field(0)
         plain: int = Field(5)
 
-    m = Mixed()
-    print("--- Mixed: defaults (dto) includes nested annotations and unmarked ---")
-    print(m.model_dump())
-    print("--- Mixed: frontend slice includes 'either' but not unmarked 'plain' ---")
-    print(m.model_dump(field_mode="frontend"))
+    mixed = Mixed()
+    show("mixed default dump", mixed.model_dump())
+    show("mixed frontend dump", mixed.model_dump(field_mode="frontend"))
 
-    print("\n--- Nesting Annotated aliases demo ---")
-    class Nesting_dto_backend(MixinModel):
+    class NestedAlias(MixinModel):
         name: FrontendType[BackendType[DtoType[str]]] = Field("n")
 
-    print(
-        Nesting_dto_backend[FrontendField](name="f"),
-        Nesting_dto_backend[BackendField](name="b"),
-        Nesting_dto_backend[LLMField](),  # empty slice
-    )
-
-    print("\n--- Conflict_default class (warn at class creation) ---")
-    class Conflict_default(MixinModel):
-        default_include_modes = {"dto"}
-        default_exclude_modes = {"dto"}
-        name: DtoType[str] = Field("n")
-        ui: FrontendType[str] = Field("u")
-        sys: BackendType[str] = Field("b")
-        vec: LLMType[int] = Field(1)
-
-    class Both(MixinModel):
-        name: DtoType[str] = Field("n")
-        ui: FrontendType[str] = Field("u")
-        sys: BackendType[str] = Field("b")
-        vec: LLMType[int] = Field(1)
-
-    print("\n--- Both: class slice with '-llm' ---")
-    AllButLLM = Both["dto", "backend", "-llm"]
-    print(AllButLLM.model_json_schema()["properties"].keys())
-
-    b = Both()
-    print("\n--- Both: runtime dump with field_mode_exclude={'llm'} (all but llm) ---")
-    print(b.model_dump(field_mode_exclude={"llm"}))
-
-    class Conflicting(MixinModel):
-        default_include_modes = {"dto", "llm"}
-        default_exclude_modes = {"llm"}
-        default_conflict_policy = "warn"
-        a: DtoType[int] = Field(1)
-        z: LLMType[int] = Field(9)
-
-    c = Conflicting()
-    print("\n--- Conflicting: defaults applied (warn once; excludes win for llm) ---")
-    print(c.model_dump())
+    show("nested alias frontend schema props", list(NestedAlias[FrontendField].model_json_schema()["properties"].keys()))
+    show("nested alias backend schema props", list(NestedAlias[BackendField].model_json_schema()["properties"].keys()))
+    show("nested alias llm schema props", list(NestedAlias[LLMField].model_json_schema()["properties"].keys()))
 
     print("\nAll demos complete.")
