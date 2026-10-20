@@ -4,7 +4,7 @@ from typing import Annotated, ClassVar, Literal, Optional, Union
 
 import pytest
 from pydantic import BaseModel, Field
-
+from pydantic_extension.model_slicing import mixin as mixin_module
 from pydantic_extension.model_slicing.mixin import (
     BackendField,
     DtoField,
@@ -190,6 +190,83 @@ def test_field_mode_exclude_without_include_uses_default_slice_then_subtracts():
     crew = make_crew()
 
     assert crew.model_dump(field_mode_exclude="llm") == {"note": "brief", "codename": "Vega", "misc": "loose"}
+
+
+def test_model_dump_reuses_resolved_type_hints_without_changing_field_slicing():
+    mixin_module._resolved_type_hints.cache_clear()
+    crew = Crew(note="brief", codename="Vega", secret="vault", vector=9)
+
+    assert crew.model_dump(field_mode="backend") == {"secret": "vault", "misc": "loose"}
+    before = mixin_module._resolved_type_hints.cache_info()
+    assert crew.model_dump(field_mode="backend") == {"secret": "vault", "misc": "loose"}
+    after = mixin_module._resolved_type_hints.cache_info()
+
+    assert after.hits > before.hits
+
+
+def test_resolved_type_hint_cache_invalidates_when_annotations_change():
+    mixin_module._resolved_type_hints.cache_clear()
+
+    class DynamicAnnotations:
+        value: str
+
+    initial = mixin_module._type_hints_for(DynamicAnnotations)
+    DynamicAnnotations.__annotations__ = {"value": int}
+    rebuilt = mixin_module._type_hints_for(DynamicAnnotations)
+
+    assert initial["value"] is str
+    assert rebuilt["value"] is int
+
+
+def test_resolved_type_hint_cache_invalidates_when_base_annotations_change():
+    mixin_module._resolved_type_hints.cache_clear()
+
+    class BaseAnnotations:
+        value: str
+
+    class DerivedAnnotations(BaseAnnotations):
+        pass
+
+    initial = mixin_module._type_hints_for(DerivedAnnotations)
+    BaseAnnotations.__annotations__ = {"value": int}
+    rebuilt = mixin_module._type_hints_for(DerivedAnnotations)
+
+    assert initial["value"] is str
+    assert rebuilt["value"] is int
+
+
+def test_resolved_type_hint_cache_invalidates_when_annotations_mutate_in_place():
+    mixin_module._resolved_type_hints.cache_clear()
+
+    class MutableAnnotations:
+        value: str
+
+    initial = mixin_module._type_hints_for(MutableAnnotations)
+    MutableAnnotations.__annotations__["value"] = int
+    rebuilt = mixin_module._type_hints_for(MutableAnnotations)
+
+    assert initial["value"] is str
+    assert rebuilt["value"] is int
+
+
+def test_metadata_cache_preserves_mutable_markers_and_unhashable_metadata():
+    mixin_module._extract_all_metadata_cached.cache_clear()
+    marker = ExcludeMode("frontend")
+    hint = Annotated[str, marker]
+
+    assert mixin_module._extract_all_metadata(hint) == (marker,)
+    before = mixin_module._extract_all_metadata_cached.cache_info()
+    assert mixin_module._extract_all_metadata(hint) == (marker,)
+    after = mixin_module._extract_all_metadata_cached.cache_info()
+    assert after.hits > before.hits
+
+    marker.modes.add("backend")
+    assert Crew._has_exclude_for_modes(hint, {"backend"})
+
+    unhashable_hint = Annotated[str, {"custom": ["metadata"]}]
+    assert mixin_module._extract_all_metadata(unhashable_hint) == (
+        {"custom": ["metadata"]},
+    )
 
 
 def test_field_mode_exclude_outside_active_default_modes_is_ignored():
