@@ -1,20 +1,38 @@
 from __future__ import annotations
 
 import copy
-import json
 import inspect
+import json
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import lru_cache
 from typing import (
-    Any, Annotated, ClassVar, Iterable, Literal, Optional, TypeAlias, TypeVar,
-    Union, get_args, get_origin, get_type_hints, Callable
+    Annotated,
+    Any,
+    Callable,
+    ClassVar,
+    Iterable,
+    Literal,
+    Optional,
+    TypeAlias,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
 )
 
-from pydantic import BaseModel as PydBaseModel, ValidationInfo, model_validator
-from pydantic import Field, ConfigDict, create_model
-from pydantic import field_serializer, SerializationInfo
-
+from pydantic import BaseModel as PydBaseModel
+from pydantic import (
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    ValidationInfo,
+    create_model,
+    field_serializer,
+    model_validator,
+)
 
 """
 Mode-based field slicing for Pydantic v2+ (and SQLModel via a shim or your own base).
@@ -46,6 +64,39 @@ Notes
 # ----------------------------
 CONTEXT_MODE_KEY = "modeslice:mode"
 CONTEXT_EXCLUDE_KEY = "modeslice:exclude"
+
+
+def _local_annotations(cls: type) -> dict[str, Any]:
+    return cls.__dict__.get("__annotations__", {})  # noqa: RUF063
+
+
+@lru_cache(maxsize=256)
+def _resolved_type_hints(
+    cls: type,
+    class_fingerprint: tuple[tuple[type, tuple[tuple[str, int], ...]], ...],
+) -> tuple[tuple[tuple[tuple[str, object], ...], ...], dict[str, Any]]:
+    """Cache resolved annotations and retain fingerprinted objects against id reuse."""
+    del class_fingerprint
+    annotation_snapshots = tuple(
+        tuple(_local_annotations(base).items())
+        for base in cls.__mro__
+    )
+    return annotation_snapshots, get_type_hints(cls, include_extras=True)
+
+
+def _type_hints_for(cls: type) -> dict[str, Any]:
+    class_fingerprint = tuple(
+        (
+            base,
+            tuple(
+                (name, id(hint))
+                for name, hint in _local_annotations(base).items()
+            ),
+        )
+        for base in cls.__mro__
+    )
+    return _resolved_type_hints(cls, class_fingerprint)[1]
+
 
 # ----------------------------
 # Markers & aliases
@@ -91,7 +142,8 @@ def use_mode(mode: str | None):
         yield
     finally:
         _CURRENT_MODE.reset(token)
-from typing import ForwardRef, List, Set, Tuple, Dict
+from typing import Dict, ForwardRef, List, Set, Tuple
+
 
 def _deep_slice_annotation(
     ann: Any,
@@ -176,7 +228,21 @@ def _infer_mode_from_stack(
 # Helpers
 # ----------------------------
 
-def _extract_all_metadata(hint: Any) -> tuple:
+@lru_cache(maxsize=2048)
+def _extract_all_metadata_cached(hint: Any) -> tuple[Any, ...]:
+    return _extract_all_metadata_uncached(hint)
+
+
+def _extract_all_metadata(hint: Any) -> tuple[Any, ...]:
+    try:
+        hash(hint)
+    except TypeError:
+        # User-supplied Annotated metadata can be unhashable; preserve support.
+        return _extract_all_metadata_uncached(hint)
+    return _extract_all_metadata_cached(hint)
+
+
+def _extract_all_metadata_uncached(hint: Any) -> tuple[Any, ...]:
     """
     Recursively collect Annotated metadata and walk Optional/Union.
     Handles nested Annotated and Optional[Annotated[...]].
@@ -446,7 +512,7 @@ class ModeSlicingMixin:
         if cache_key in cls._slice_cache:
             return cls._slice_cache[cache_key]
 
-        hints = get_type_hints(cls, include_extras=True)
+        hints = _type_hints_for(cls)
         fields_for_dynamic: dict[str, tuple[Any, Any]] = {}
 
         for fname, hint in hints.items():
@@ -637,7 +703,7 @@ class ModeSlicingMixin:
         current_exclude = None if exclude is None else (set(exclude) if not isinstance(exclude, dict) else exclude)
 
         if inc or exc:
-            hints = get_type_hints(self.__class__, include_extras=True)
+            hints = _type_hints_for(self.__class__)
             wanted: set[str] = set()
             for fname, hint in hints.items():
                 f_modes = self.__class__._field_modes_from_hint(hint)
