@@ -4,15 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydantic-extension"
-version = "0.0.6"
+version = "0.0.8"
 authors = [
   { name="HumbleMat", email="humblemat@gmail.com" },
 ]
 description = "Handy pydantic extension for advanced slicing and FASTAPI, LLM context awareness"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 license = "MIT"
