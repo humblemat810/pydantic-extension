@@ -67,7 +67,7 @@ CONTEXT_EXCLUDE_KEY = "modeslice:exclude"
 
 
 def _local_annotations(cls: type) -> dict[str, Any]:
-    return cls.__dict__.get("__annotations__", {})  # noqa: RUF063
+    return inspect.get_annotations(cls, eval_str=False)
 
 
 @lru_cache(maxsize=256)
